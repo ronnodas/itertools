@@ -1,14 +1,12 @@
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use std::fmt;
 use std::iter::FusedIterator;
 
-use super::lazy_buffer::LazyBuffer;
+use super::lazy_buffer::{ArrayOrVecHelper, LazyBuffer, MaybeConstUsize};
 use crate::size_hint::{self, SizeHint};
-use crate::combinations::{MaybeConstUsize, PoolIndex};
 
 #[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
-pub struct PermutationsGeneric<I: Iterator, Idx: PoolIndex> {
+pub struct PermutationsGeneric<I: Iterator, Idx: ArrayOrVecHelper> {
     vals: LazyBuffer<I>,
     state: PermutationState<Idx>,
 }
@@ -18,34 +16,30 @@ pub struct PermutationsGeneric<I: Iterator, Idx: PoolIndex> {
 ///
 /// See [`.permutations()`](crate::Itertools::permutations) for
 /// more information.
-pub type Permutations<I> = PermutationsGeneric<I, Vec<usize>>;
+pub type Permutations<I> = PermutationsGeneric<I, Box<[usize]>>;
 
 impl<I, Idx> Clone for PermutationsGeneric<I, Idx>
 where
     I: Clone + Iterator,
     I::Item: Clone,
-    Idx: Clone + PoolIndex,
+    Idx: Clone + ArrayOrVecHelper,
 {
     clone_fields!(vals, state);
 }
 
 #[derive(Clone, Debug)]
-enum PermutationState<Idx: PoolIndex> {
+enum PermutationState<Idx: ArrayOrVecHelper> {
     /// No permutation generated yet.
     Start { k: Idx::Length },
     /// Values from the iterator are not fully loaded yet so `n` is still unknown.
-    Buffered { k: Idx::Length, min_n: usize },
+    Buffered { indices: Idx, min_n: usize },
     /// All values from the iterator are known so `n` is known.
-    Loaded {
-        indices: Box<[usize]>,
-        cycles: Box<[usize]>, // TODO Should be Idx::Item<usize>
-        k: Idx::Length, // TODO Should be inferred from cycles
-    },
+    Loaded { indices: Box<[usize]>, cycles: Idx },
     /// No permutation left to generate.
     End,
 }
 
-impl<I, Idx: PoolIndex> fmt::Debug for PermutationsGeneric<I, Idx>
+impl<I, Idx: ArrayOrVecHelper> fmt::Debug for PermutationsGeneric<I, Idx>
 where
     I: Iterator + fmt::Debug,
     I::Item: fmt::Debug,
@@ -61,10 +55,11 @@ pub fn permutations<I: Iterator>(iter: I, k: usize) -> Permutations<I> {
     }
 }
 
-impl<I, Idx: PoolIndex> Iterator for PermutationsGeneric<I, Idx>
+impl<I, Idx> Iterator for PermutationsGeneric<I, Idx>
 where
     I: Iterator,
     I::Item: Clone,
+    Idx: ArrayOrVecHelper,
 {
     type Item = Idx::Item<I::Item>;
 
@@ -80,45 +75,44 @@ where
                         *state = PermutationState::End;
                         return None;
                     }
-                    *state = PermutationState::Buffered { k, min_n: k.value() };
+                    *state = PermutationState::Buffered {
+                        indices: Idx::start(k),
+                        min_n: k.value(),
+                    };
                 }
-                Some(Idx::from_fn(k, |i| vals[i].clone()))
+                Some(Idx::start(k).extract_item(vals))
             }
-            PermutationState::Buffered { k, min_n } => {
+            PermutationState::Buffered { indices, min_n } => {
+                let k = indices.len();
                 if vals.get_next() {
-                    // TODO This is ugly. Maybe working on indices is better?
-                    let item = Idx::from_fn(*k, |i| {
-                        vals[if i==k.value()-1 {
-                            *min_n
-                        } else {
-                            i
-                        }].clone()
-                    });
+                    indices.borrow_mut()[k.value() - 1] += 1;
                     *min_n += 1;
-                    Some(item)
+                    Some(indices.extract_item(vals))
                 } else {
                     let n = *min_n;
                     let prev_iteration_count = n - k.value() + 1;
                     let mut indices: Box<[_]> = (0..n).collect();
-                    let mut cycles: Box<[_]> = (n - k.value()..n).rev().collect();
+                    let mut cycles = Idx::from_fn(k, |i| n - 1 - i);
                     // Advance the state to the correct point.
                     for _ in 0..prev_iteration_count {
-                        if advance(&mut indices, &mut cycles) {
+                        if advance(&mut indices, cycles.borrow_mut()) {
                             *state = PermutationState::End;
                             return None;
                         }
                     }
-                    let item = Idx::from_fn(*k, |i| vals[indices[i]].clone());
-                    *state = PermutationState::Loaded { indices, cycles, k:*k };
+                    let item = Idx::item_from_fn(k, |i| vals[indices[i]].clone());
+                    *state = PermutationState::Loaded { indices, cycles };
                     Some(item)
                 }
             }
-            PermutationState::Loaded { indices, cycles, k} => {
-                if advance(indices, cycles) {
+            PermutationState::Loaded { indices, cycles } => {
+                if advance(indices, cycles.borrow_mut()) {
                     *state = PermutationState::End;
                     return None;
                 }
-                Some(Idx::from_fn(*k, |i| vals[indices[i]].clone()))
+                Some(Idx::item_from_fn(cycles.len(), |i| {
+                    vals[indices[i]].clone()
+                }))
             }
             PermutationState::End => None,
         }
@@ -138,7 +132,7 @@ where
     }
 }
 
-impl<I, Idx: PoolIndex> FusedIterator for PermutationsGeneric<I, Idx>
+impl<I, Idx: ArrayOrVecHelper> FusedIterator for PermutationsGeneric<I, Idx>
 where
     I: Iterator,
     I::Item: Clone,
@@ -163,7 +157,7 @@ fn advance(indices: &mut [usize], cycles: &mut [usize]) -> bool {
     true
 }
 
-impl<Idx: PoolIndex> PermutationState<Idx> {
+impl<Idx: ArrayOrVecHelper> PermutationState<Idx> {
     fn size_hint_for(&self, n: usize) -> SizeHint {
         // At the beginning, there are `n!/(n-k)!` items to come.
         let at_start = |n, k: Idx::Length| {
@@ -174,19 +168,23 @@ impl<Idx: PoolIndex> PermutationState<Idx> {
         match *self {
             Self::Start { k } if n < k.value() => (0, Some(0)),
             Self::Start { k } => at_start(n, k),
-            Self::Buffered { k, min_n } => {
+            Self::Buffered { ref indices, min_n } => {
+                let k = indices.len();
                 // Same as `Start` minus the previously generated items.
                 size_hint::sub_scalar(at_start(n, k), min_n - k.value() + 1)
             }
             Self::Loaded {
                 ref indices,
                 ref cycles,
-                k: _,
             } => {
-                let count = cycles.iter().enumerate().try_fold(0usize, |acc, (i, &c)| {
-                    acc.checked_mul(indices.len() - i)
-                        .and_then(|count| count.checked_add(c))
-                });
+                let count = cycles
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .try_fold(0usize, |acc, (i, &c)| {
+                        acc.checked_mul(indices.len() - i)
+                            .and_then(|count| count.checked_add(c))
+                    });
                 (count.unwrap_or(usize::MAX), count)
             }
             Self::End => (0, Some(0)),

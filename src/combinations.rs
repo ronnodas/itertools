@@ -1,9 +1,7 @@
-use core::array;
-use core::borrow::BorrowMut;
 use std::fmt;
 use std::iter::FusedIterator;
 
-use super::lazy_buffer::LazyBuffer;
+use super::lazy_buffer::{ArrayOrVecHelper, ConstUsize, LazyBuffer, MaybeConstUsize as _};
 use alloc::vec::Vec;
 
 use crate::adaptors::checked_binomial;
@@ -18,7 +16,7 @@ pub fn combinations<I: Iterator>(iter: I, k: usize) -> Combinations<I>
 where
     I::Item: Clone,
 {
-    Combinations::new(iter, (0..k).collect())
+    Combinations::new(iter, ArrayOrVecHelper::start(k))
 }
 
 /// Create a new `ArrayCombinations` from a clonable iterator.
@@ -26,7 +24,7 @@ pub fn array_combinations<I: Iterator, const K: usize>(iter: I) -> ArrayCombinat
 where
     I::Item: Clone,
 {
-    ArrayCombinations::new(iter, array::from_fn(|i| i))
+    ArrayCombinations::new(iter, ArrayOrVecHelper::start(ConstUsize))
 }
 
 /// An iterator to iterate through all the `k`-length combinations in an iterator.
@@ -37,79 +35,6 @@ pub struct CombinationsGeneric<I: Iterator, Idx> {
     indices: Idx,
     pool: LazyBuffer<I>,
     first: bool,
-}
-
-pub trait MaybeConstUsize : Clone + Copy + std::fmt::Debug {
-    /*TODO const*/fn value(self) -> usize;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ConstUsize<const N: usize>;
-impl<const N: usize> MaybeConstUsize for ConstUsize<N> {
-    fn value(self) -> usize {
-        N
-    }
-}
-
-impl MaybeConstUsize for usize {
-    fn value(self) -> usize {
-        self
-    }
-}
-
-/// A type holding indices of elements in a pool or buffer of items from an inner iterator
-/// and used to pick out different combinations in a generic way.
-pub trait PoolIndex: BorrowMut<[usize]> {
-    type Item<T>;
-    type Length: MaybeConstUsize;
-
-    fn extract_item<I: Iterator>(&self, pool: &LazyBuffer<I>) -> Self::Item<I::Item>
-    where
-        I::Item: Clone;
-
-    fn from_fn<T, F: Fn(usize)->T>(k: Self::Length, f: F) -> Self::Item<T>;
-
-    fn len(&self) -> Self::Length;
-}
-
-impl PoolIndex for Vec<usize> {
-    type Item<T> = Vec<T>;
-    type Length = usize;
-
-    fn extract_item<I: Iterator>(&self, pool: &LazyBuffer<I>) -> Self::Item<I::Item>
-    where
-        I::Item: Clone
-    {
-        pool.get_at(self)
-    }
-
-    fn from_fn<T, F: Fn(usize)->T>(k: Self::Length, f: F) -> Self::Item<T> {
-        (0..k).map(f).collect()
-    }
-    
-    fn len(&self) -> Self::Length {
-        self.len()
-    }
-}
-
-impl<const K: usize> PoolIndex for [usize; K] {
-    type Item<T> = [T; K];
-    type Length = ConstUsize<K>;
-
-    fn extract_item<I: Iterator>(&self, pool: &LazyBuffer<I>) -> Self::Item<I::Item>
-    where
-        I::Item: Clone
-    {
-        pool.get_array(*self)
-    }
-
-    fn from_fn<T, F: Fn(usize)->T>(_k: Self::Length, f: F) -> Self::Item<T> {
-        std::array::from_fn(f)
-    }
-
-    fn len(&self) -> Self::Length {
-        ConstUsize::<K>
-    }
 }
 
 impl<I, Idx> Clone for CombinationsGeneric<I, Idx>
@@ -130,7 +55,7 @@ where
     debug_fmt_fields!(Combinations, indices, pool, first);
 }
 
-impl<I: Iterator, Idx: PoolIndex> CombinationsGeneric<I, Idx> {
+impl<I: Iterator, Idx: ArrayOrVecHelper> CombinationsGeneric<I, Idx> {
     /// Constructor with arguments the inner iterator and the initial state for the indices.
     fn new(iter: I, indices: Idx) -> Self {
         Self {
@@ -142,8 +67,8 @@ impl<I: Iterator, Idx: PoolIndex> CombinationsGeneric<I, Idx> {
 
     /// Returns the length of a combination produced by this iterator.
     #[inline]
-    pub fn k(&self) -> Idx::Length {
-        self.indices.len()
+    pub fn k(&self) -> usize {
+        self.indices.len().value()
     }
 
     /// Returns the (current) length of the pool from which combination elements are
@@ -247,7 +172,7 @@ impl<I, Idx> Iterator for CombinationsGeneric<I, Idx>
 where
     I: Iterator,
     I::Item: Clone,
-    Idx: PoolIndex,
+    Idx: ArrayOrVecHelper,
 {
     type Item = Idx::Item<I::Item>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -285,7 +210,7 @@ impl<I, Idx> FusedIterator for CombinationsGeneric<I, Idx>
 where
     I: Iterator,
     I::Item: Clone,
-    Idx: PoolIndex,
+    Idx: ArrayOrVecHelper,
 {
 }
 
